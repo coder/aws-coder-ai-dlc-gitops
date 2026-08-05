@@ -21,7 +21,7 @@ terraform {
 
 variable "namespace" {
   type        = string
-  description = "The Kubernetes namespace to create workspaces in (must exist prior to creating workspaces). If the Coder host is itself running as a Pod on the same Kubernetes cluster as you are deploying workspaces to, set this to the same namespace."
+  description = "The Kubernetes namespace to create workspaces in (must exist prior to creating workspaces)."
   default     = "coder-ws"
 }
 
@@ -37,75 +37,10 @@ variable "efs_file_system_id" {
   default     = ""
 }
 
-variable "mcp_api_key_fiddler" {
-  type        = string
-  description = "Fiddler AI API key (Bearer) for the Fiddler GenAI MCP server."
-  sensitive   = true
-  default     = ""
-}
-
-variable "fiddler_url" {
-  type        = string
-  description = "Fiddler instance base URL for the Fiddler GenAI MCP server (optional)."
-  default     = "https://app.fiddler.ai"
-}
-
-variable "mcp_api_key_langsmith" {
-  type        = string
-  description = "LangSmith API key (sent as X-Api-Key) for the LangSmith remote MCP server."
-  sensitive   = true
-  default     = ""
-}
-
-variable "mcp_api_key_llamacloud" {
-  type        = string
-  description = "LlamaCloud API key for the LlamaCloud MCP server."
-  sensitive   = true
-  default     = ""
-}
-
-variable "llamacloud_project_name" {
-  type        = string
-  description = "Optional LlamaCloud project name for the LlamaCloud MCP server."
-  default     = ""
-}
-
-variable "llamacloud_index" {
-  type        = string
-  description = "Optional LlamaCloud index ('name:description') exposed as a tool by the LlamaCloud MCP server."
-  default     = ""
-}
-
 locals {
-  home_dir        = "/home/coder"
-
-  # MCP servers shared by Kiro (mcp.json) and Claude Code (user scope):
-  # Fiddler GenAI (observability) + LangSmith (LangChain) as remote HTTP,
-  # LlamaCloud (LlamaIndex) over stdio via uvx. Security partners (HiddenLayer,
-  # Protopia) have no MCP server; their SDKs are pre-baked in the image instead.
-  mcp_servers = merge(
-    {
-      "fiddler-genai" = {
-        type    = "http"
-        url     = "${var.fiddler_url}/v1/mcp/genai/"
-        headers = { Authorization = "Bearer ${var.mcp_api_key_fiddler}" }
-      }
-      "langsmith" = {
-        type    = "http"
-        url     = "https://api.smith.langchain.com/mcp"
-        headers = { "X-Api-Key" = var.mcp_api_key_langsmith }
-      }
-      "llamacloud" = {
-        command = "/usr/local/bin/uvx"
-        args = concat(
-          ["llamacloud-mcp@latest", "--api-key", var.mcp_api_key_llamacloud],
-          var.llamacloud_project_name != "" ? ["--project-name", var.llamacloud_project_name] : [],
-          var.llamacloud_index != "" ? ["--index", var.llamacloud_index] : [],
-        )
-      }
-    }
-  )
-  mcp_json = jsonencode({ mcpServers = local.mcp_servers })
+  home_dir = "/home/coder"
+  bin_path = "/home/coder/.local/bin:/home/coder/bin:/home/coder/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  cost     = 2
 }
 
 # Minimum vCPUs needed 
@@ -120,7 +55,7 @@ data "coder_parameter" "cpu" {
   }
   form_type = "input"
   mutable   = true
-  default   = 2
+  default   = 4
   order     = 1
 }
 
@@ -136,7 +71,7 @@ data "coder_parameter" "memory" {
   }
   form_type = "input"
   mutable   = true
-  default   = 4
+  default   = 8
   order     = 2
 }
 
@@ -144,18 +79,16 @@ data "coder_parameter" "memory" {
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 
-locals {
-    cost = 2
-    home_folder = "/home/coder"
+resource "coder_env" "path" {
+  agent_id = coder_agent.dev.id
+  name     = "PATH"
+  value    = local.bin_path
 }
 
 resource "coder_agent" "dev" {
     arch = "amd64"
     os = "linux"
 
-    env = {
-        PATH = "/home/coder/.local/bin:/home/coder/bin:/home/coder/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    }
     display_apps {
         vscode          = false
         vscode_insiders = false
@@ -197,43 +130,6 @@ resource "coder_agent" "dev" {
 
     # Update PATH for current session
     export PATH="$HOME/.local/bin:$HOME/bin:$HOME/.npm-global/bin:$PATH"
-
-    # Configure Kiro CLI MCP servers (Fiddler GenAI, LangSmith, LlamaCloud)
-    echo "Configuring Kiro CLI MCP servers..."
-
-    # Create user-level MCP configuration
-    mkdir -p $HOME/.kiro/settings
-    cat > $HOME/.kiro/settings/mcp.json <<'MCP_EOF'
-${local.mcp_json}
-MCP_EOF
-
-    echo "Kiro CLI MCP configuration completed (user-level)"
-
-    # Configure workspace trust settings for Kiro IDE
-    echo "Configuring Kiro IDE workspace trust..."
-    mkdir -p $HOME/.local/share/code-server/User
-
-    # Create or update settings.json to trust the home folder
-    cat > $HOME/.local/share/code-server/User/settings.json <<'SETTINGS_EOF'
-{
-  "security.workspace.trust.enabled": true,
-  "security.workspace.trust.startupPrompt": "never",
-  "security.workspace.trust.emptyWindow": false,
-  "security.workspace.trust.untrustedFiles": "open"
-}
-SETTINGS_EOF
-
-    # Add trusted folders configuration
-    mkdir -p $HOME/.kiro/settings
-    cat > $HOME/.kiro/settings/trusted-workspaces.json <<'TRUST_EOF'
-{
-  "trustedFolders": [
-    "/home/coder"
-  ]
-}
-TRUST_EOF
-
-    echo "Kiro IDE workspace trust configuration completed"
 
     #Symlink Coder Agent
     ln -sf /tmp/coder.*/coder "$CODER_SCRIPT_BIN_DIR/coder"
@@ -302,76 +198,10 @@ module "code-server" {
     source   = "registry.coder.com/coder/code-server/coder"
     version  = "1.3.1"
     agent_id       = coder_agent.dev.id
-    folder         = local.home_folder
+    folder         = local.home_dir
     subdomain = false
     order = 0
     extensions = ["ms-toolsai.jupyter"]
-}
-
-module "kiro" {
-    source   = "registry.coder.com/coder/kiro/coder"
-    version  = "1.1.0"
-    agent_id = coder_agent.dev.id
-    order = 1
-}
-
-# Auto-install the Jupyter extension for the Kiro IDE.
-# Kiro connects as a desktop client and downloads its remote server on first
-# connect, so we install into the (EFS-persistent) Kiro server extensions dir:
-# immediately if the server is already present, otherwise via a one-time
-# background poller. Dependencies resolve automatically from Open VSX.
-resource "coder_script" "kiro_jupyter_extension" {
-    agent_id           = coder_agent.dev.id
-    display_name       = "Kiro: install Jupyter extension"
-    icon               = "/icon/kiro.svg"
-    run_on_start       = true
-    start_blocks_login = false
-    script             = <<-EOT
-    #!/bin/sh
-    set -eu
-    EXT_ID="ms-toolsai.jupyter"
-    KIRO_BIN="$HOME/.kiro-server/bin"
-    SENTINEL="$HOME/.kiro-server/.jupyter-ext-installed"
-
-    if [ -f "$SENTINEL" ]; then
-      echo "Kiro: $EXT_ID already provisioned."
-      exit 0
-    fi
-
-    install_ext() {
-      SRV=$(find "$KIRO_BIN" -maxdepth 3 -type f -name kiro-server 2>/dev/null | head -1)
-      [ -n "$SRV" ] || return 1
-      "$SRV" --install-extension "$EXT_ID" && touch "$SENTINEL"
-    }
-
-    if install_ext; then
-      echo "Kiro: installed $EXT_ID."
-    else
-      # Server not downloaded yet (first connect pending) - poll in background.
-      (
-        i=0
-        while [ "$i" -lt 120 ]; do
-          sleep 30
-          if install_ext; then
-            echo "Kiro: installed $EXT_ID after connect."
-            break
-          fi
-          i=$((i + 1))
-        done
-      ) >/tmp/kiro-jupyter-install.log 2>&1 &
-      echo "Kiro: will install $EXT_ID on first connect (background)."
-    fi
-    EOT
-}
-
-resource "coder_app" "kiro_cli" {
-    agent_id     = coder_agent.dev.id
-    slug         = "kiro-auth"
-    display_name = "Kiro CLI"
-    icon         = "${data.coder_workspace.me.access_url}/icon/kiro.svg"
-    command      = "kiro-cli"
-    share        = "owner"
-    order        = 2
 }
 
 
@@ -519,7 +349,7 @@ resource "kubernetes_deployment" "dev" {
             }
           }
           volume_mount {
-            mount_path = "/home/coder"
+            mount_path = local.home_dir
             name       = "home"
             read_only  = false
           }

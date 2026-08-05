@@ -1,16 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: Cloudformation template for Coder and AWS Modernization Workshop
 Parameters:
-  WksModelS3BucketName:
-    Description: Assets bucket name
-    Type: String
-    Default: "ws-assets-prod-iad-r-gru-527b8c19222c1182"
-    
-  WksModelS3Prefix:
-    Description: Assets bucket prefix
-    Type: String
-    Default: "0e51c8ed-274c-4bf1-97b1-7758d17d5e1b/"
-
   KubernetesVersion:
     Description: Kubernetes version
     Type: String
@@ -19,7 +9,7 @@ Parameters:
   CoderVersion:
     Description: Coder version
     Type: String
-    Default: "2.30.2"
+    Default: "2.34.4"
 
   EKSClusterName:
     Description: Name of EKS Cluster
@@ -60,28 +50,25 @@ Parameters:
 
   CoderAdminPassword:
     Type: String
-    Description: Administrator password for Coder
+    Description: Administrator password for Coder (auto-generated, ignore this parameter)
     NoEcho: true
-    MinLength: 8
-    Default: admin@coder
+    Default: "auto-generated"
 
   CoderAdminName:
     Type: String
     Description: Coder Administrator Full Name
     Default: "Admin User"
 
-  CoderPremiumTrial:
+
+  CoderLicenseKey:
     Type: String
-    Description: Start 30-Day Coder Premium Trial
-    AllowedValues:
-      - "true"
-      - "false"
-    Default: "false"
+    Description: Coder Premium Trial License Key
+    Default: ""
 
   CoderGitOpsTemplateRepoURL:
     Type: String
     Description: Coder GitOps Template Repository URL
-    Default: "https://github.com/coder/aws-coder-ai-dlc-gitops.git"
+    Default: "https://github.com/greg-the-coder/aws-coder-ai-dlc-gitops.git"
     
   RetryFlag:
     Type: String
@@ -241,7 +228,7 @@ Resources:
                   ## CFN for knowledge bases creation
                   ## for Lyzr\Arize user need to create correct Cross Account role - its precreated but in a case smth incorrect
                   - bedrock:*
-                  ## access to models
+                  - bedrock-agentcore:*
                   - aws-marketplace:ViewSubscriptions
                   - aws-marketplace:Subscribe
                   - s3:*
@@ -260,6 +247,7 @@ Resources:
                   - iam:PassRole
                   - iam:TagRole
                   - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
                   - iam:CreateInstanceProfile
                   - iam:GetInstanceProfile
                   - iam:ListInstanceProfiles
@@ -275,6 +263,14 @@ Resources:
                   - iam:UntagOpenIDConnectProvider
                   - iam:AddClientIDToOpenIDConnectProvider
                   - iam:UpdateOpenIDConnectProviderThumbprint
+                  - iam:CreateUser
+                  - iam:GetUser
+                  - iam:DeleteUser
+                  - iam:TagUser
+                  - iam:CreateServiceSpecificCredential
+                  - iam:ListServiceSpecificCredentials
+                  - iam:DeleteServiceSpecificCredential
+                  - iam:UpdateServiceSpecificCredential
                 Resource: "*"
               # Deny modification of AWS managed and workshop roles
               - Effect: Deny
@@ -302,6 +298,9 @@ Resources:
                   - logs:*
                   - kms:*
                   - cloudformation:*
+                  - ecr:*
+                  - codebuild:*
+                  - elasticfilesystem:*
                   - events:Describe*
                   - events:List*
                   - sts:AssumeRole
@@ -349,6 +348,69 @@ Resources:
       InstanceProfileName: !Sub "coder-workshop-ec2-workspace-profile"
       Roles:
         - !Ref WorkshopCoderRole
+
+  BedrockApiKeyUser:
+    Type: AWS::IAM::User
+    DependsOn: WorkshopCoderRole
+    Properties:
+      UserName: !Sub 'coder-bedrock-api-key-user-${AWS::StackName}'
+      Policies:
+        - PolicyName: BedrockInvokeAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock-mantle:*
+                Resource: '*'
+      Tags:
+        - Key: Purpose
+          Value: CoderAIGatewayBedrockMantleKey
+        - Key: ManagedBy
+          Value: !Ref AWS::StackName
+
+  BedrockMantleApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'coder-bedrock-mantle-api-key-${AWS::StackName}'
+      Description: !Sub >-
+        Bedrock Mantle ServiceCredentialSecret for Coder AI Gateway openai-compat provider.
+        IAM user: coder-bedrock-api-key-user-${AWS::StackName}.
+        Populated by CodeBuild post_build.
+      SecretString: 'PENDING_CODEBUILD_POPULATION'
+      Tags:
+        - Key: Purpose
+          Value: CoderAIGatewayBedrockMantleKey
+        - Key: ManagedBy
+          Value: !Ref AWS::StackName
+
+  FargatePodExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EKSClusterName}-fargate-pod-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks-fargate-pods.amazonaws.com
+            Action:
+              - sts:AssumeRole
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:eks:${AWS::Region}:${AWS::AccountId}:fargateprofile/${EKSClusterName}/*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSFargatePodExecutionRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-fargate-pod-execution'
 
 ################## VPC Setup #####################
 
@@ -424,6 +486,30 @@ Resources:
       Tags:
         - Key: Name
           Value: ${EKSClusterName}/SubnetPrivate2
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  FargateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CoderVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 192.168.160.0/19
+      Tags:
+        - Key: Name
+          Value: ${EKSClusterName}/SubnetFargate1
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  FargateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CoderVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 192.168.192.0/19
+      Tags:
+        - Key: Name
+          Value: ${EKSClusterName}/SubnetFargate2
         - Key: kubernetes.io/role/internal-elb
           Value: '1'
 
@@ -533,6 +619,63 @@ Resources:
       RouteTableId: !Ref PrivateRouteTable2
       SubnetId: !Ref PrivateSubnet2
 
+  FargateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref FargateSubnet1
+
+  FargateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref FargateSubnet2
+
+################## EFS for Fargate Workspaces #####################
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS from VPC for Coder workspace EFS
+      VpcId: !Ref CoderVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: 192.168.0.0/16
+          Description: Allow NFS from VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-efs-sg'
+
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      ThroughputMode: elastic
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-coder-workspace-homes'
+
+  EfsMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: !Ref FargateSubnet1
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  EfsMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: !Ref FargateSubnet2
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
 ################## Secrets Manager #####################
 
   CoderAdminPasswordSecret:
@@ -540,7 +683,12 @@ Resources:
     Properties:
       Name: !Sub '${EKSClusterName}-coder-admin-password'
       Description: Coder Administrator Password
-      SecretString: !Ref CoderAdminPassword
+      GenerateSecretString:
+        PasswordLength: 12
+        ExcludeCharacters: '"@/\\'
+        ExcludePunctuation: false
+        IncludeSpace: false
+        RequireEachIncludedType: true
 
   CoderSessionTokenSecret:
     Type: AWS::SecretsManager::Secret
@@ -618,7 +766,7 @@ Resources:
 ################## EKS Bootstrap #####################
 
   BuildProject:
-    DependsOn: [WorkshopInstanceProfile, CoderAuroraInstance]
+    DependsOn: [WorkshopInstanceProfile, CoderAuroraInstance, FargatePodExecutionRole, EfsMountTarget1, EfsMountTarget2]
     Type: AWS::CodeBuild::Project
     Properties:
       Name: !Sub CodeBuild-${AWS::StackName}
@@ -677,25 +825,37 @@ Resources:
           - Name: CoderAdminName
             Value: !Ref CoderAdminName
           - Name: CoderAdminPassword
-            Value: !Ref CoderAdminPassword
+            Value: !Sub '{{resolve:secretsmanager:${CoderAdminPasswordSecret}:SecretString}}'
           - Name: CoderAdminUser
             Value: !Ref CoderAdminUser
-          - Name: CoderPremiumTrial
-            Value: !Ref CoderPremiumTrial      
+          - Name: CoderLicenseKey
+            Value: !Ref CoderLicenseKey      
           - Name: RetryFlag
             Value: !Ref RetryFlag    
           - Name: CoderGitOpsTemplateRepoURL
             Value: !Ref CoderGitOpsTemplateRepoURL  
           - Name: CoderSessionTokenSecretArn
             Value: !Ref CoderSessionTokenSecret  
-          - Name: WksModelS3BucketName
-            Value: !Ref WksModelS3BucketName  
-          - Name: WksModelS3Prefix
-            Value: !Ref WksModelS3Prefix  
           - Name: CLOUDFRONT_DISTRIBUTION_ID
             Value: !Ref CoderCloudFrontDistribution
           - Name: CLOUDFRONT_DOMAIN
             Value: !GetAtt CoderCloudFrontDistribution.DomainName
+          - Name: FargateSubnet1
+            Value: !Ref FargateSubnet1
+          - Name: FargateSubnet2
+            Value: !Ref FargateSubnet2
+          - Name: FargatePodExecutionRoleArn
+            Value: !GetAtt FargatePodExecutionRole.Arn
+          - Name: EfsFileSystemId
+            Value: !Ref EfsFileSystem
+          - Name: ClaudeCodeImageUri
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EKSClusterName}/coder-workspace-claude-code:latest'
+          - Name: KiroCliImageUri
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EKSClusterName}/coder-workspace-kiro-cli:latest'
+          - Name: ChallengeImageUri
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EKSClusterName}/coder-workspace-challenge:latest'
+          - Name: BEDROCK_MANTLE_SECRET_ARN
+            Value: !Ref BedrockMantleApiKeySecret
           
       Source:
         Type: NO_SOURCE
@@ -720,7 +880,6 @@ Resources:
                     region: ${AWSRegion}
                     version: "${KubernetesVersion}"
                   
-                  # Proper Auto Mode configuration as per AWS docs
                   autoModeConfig:
                     enabled: true
                   
@@ -740,6 +899,8 @@ Resources:
                   
                   addons:
                     - name: aws-ebs-csi-driver
+                      version: latest
+                    - name: aws-efs-csi-driver
                       version: latest  
                       
                   cloudWatch:
@@ -785,11 +946,18 @@ Resources:
                     
                     aws eks update-kubeconfig --region ${AWSRegion} --name ${EKSClusterName}
                     
+                    aws eks create-addon --cluster-name ${EKSClusterName} --addon-name coredns --region ${AWSRegion} || true
+                    echo "Waiting for CoreDNS addon to become ACTIVE..."
+                    aws eks wait addon-active --cluster-name ${EKSClusterName} --addon-name coredns --region ${AWSRegion} || true
+                    
                     ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
                     PARTICIPANT_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/WSParticipantRole"
                     
-                    curl -o storageclass.yaml https://raw.githubusercontent.com/coder/aws-workshop-samples/refs/heads/main/coder-admin/storageclass.yaml
-                    curl -o coder-core-values-v2.yaml https://raw.githubusercontent.com/coder/aws-workshop-samples/refs/heads/main/coder-admin/coder-core-values-v2.yaml
+                    git clone $CoderGitOpsTemplateRepoURL
+                    CODER_GITOPS_DIR=$(basename "$CoderGitOpsTemplateRepoURL" .git)
+
+                    cp "$CODER_GITOPS_DIR/infrastructure/k8s/gp3-storageclass.yaml" storageclass.yaml
+                    cp "$CODER_GITOPS_DIR/infrastructure/helm/coder-values.yaml" coder-core-values-v2.yaml
                     helm repo add coder-v2 https://helm.coder.com/v2
                     helm repo update
 
@@ -799,6 +967,24 @@ Resources:
                       kubectl create configmap aws-auth -n kube-system --from-literal=mapRoles="[{\"rolearn\":\"$PARTICIPANT_ROLE_ARN\",\"username\":\"workshop-user\",\"groups\":[\"system:masters\"]}]" --dry-run=client -o yaml | kubectl apply -f -
                       kubectl create namespace coder
                       
+                      kubectl create namespace coder-ws
+                      
+                      kubectl apply -f "$CODER_GITOPS_DIR/infrastructure/k8s/coder-workspace-rbac.yaml"
+                      kubectl apply -f "$CODER_GITOPS_DIR/infrastructure/k8s/efs-storageclass.yaml"
+                      
+                      aws eks create-fargate-profile \
+                        --cluster-name ${EKSClusterName} \
+                        --fargate-profile-name coder-workspaces \
+                        --pod-execution-role-arn ${FargatePodExecutionRoleArn} \
+                        --subnets ${FargateSubnet1} ${FargateSubnet2} \
+                        --selectors namespace=coder-ws
+                      
+                      echo "Waiting for Fargate profile to become ACTIVE..."
+                      aws eks wait fargate-profile-active \
+                        --cluster-name ${EKSClusterName} \
+                        --fargate-profile-name coder-workspaces
+                      echo "Fargate profile is ACTIVE"
+
                       PostgreSQLConnectionURL="postgresql://${Username}:${Password}@${PostgreSQLClusterAddress}:${PostgreSQLPort}/${DatabaseName}"
                       kubectl create secret generic coder-db-url -n coder --from-literal=url="$PostgreSQLConnectionURL"
                  
@@ -818,22 +1004,32 @@ Resources:
 
                     if [ "$RetryFlag" != "True" ]; then
                       aws eks create-pod-identity-association \
-                      --cluster-name coder-aws-cluster \
+                      --cluster-name ${EKSClusterName} \
                       --namespace coder \
                       --service-account coder \
                       --role-arn arn:aws:iam::$ACCOUNT_ID:role/coder-and-aws-workshop-user
+
+                      echo "Configuring IRSA for Fargate workspace pods..."
+                      
+                      chmod +x "$CODER_GITOPS_DIR/infrastructure/scripts/irsa-trust-policy-update.sh"
+                      "$CODER_GITOPS_DIR/infrastructure/scripts/irsa-trust-policy-update.sh" \
+                        "${EKSClusterName}" \
+                        "coder-and-aws-workshop-user" \
+                        "coder-ws" \
+                        "coder-ws"
+                      
+                      sed "s|PLACEHOLDER_ROLE_ARN|arn:aws:iam::${ACCOUNT_ID}:role/coder-and-aws-workshop-user|g" "$CODER_GITOPS_DIR/infrastructure/k8s/coder-ws-serviceaccount.yaml" \
+                        | kubectl apply -f -
+                      echo "Created coder-ws service account with IRSA annotation"
                     fi
 
                     if [ -n "$CODER_LB_HOSTNAME" ]; then
-                      # Update the CloudFront distribution origin with the actual NLB hostname
                       echo "Updating CloudFront distribution $CLOUDFRONT_DISTRIBUTION_ID with origin $CODER_LB_HOSTNAME"
 
-                      # Get the current distribution config and ETag
                       CF_CONFIG=$(aws cloudfront get-distribution-config --id "$CLOUDFRONT_DISTRIBUTION_ID")
                       ETAG=$(echo "$CF_CONFIG" | jq -r '.ETag')
                       DIST_CONFIG=$(echo "$CF_CONFIG" | jq '.DistributionConfig')
 
-                      # Replace the placeholder origin with the actual NLB hostname
                       UPDATED_CONFIG=$(echo "$DIST_CONFIG" | jq --arg hostname "$CODER_LB_HOSTNAME" \
                         '.Origins.Items[0].DomainName = $hostname')
 
@@ -849,7 +1045,6 @@ Resources:
                       echo "CloudFront Distribution ID: $DISTRIBUTION_ID"
                       echo "CloudFront Domain: $CLOUDFRONT_DOMAIN"
 
-                      # Check deployment status
                       echo "Waiting for CloudFront distribution to deploy..."
                       while true; do
                         STATUS=$(aws cloudfront get-distribution --id $DISTRIBUTION_ID --query 'Distribution.Status' --output text)
@@ -862,7 +1057,6 @@ Resources:
                         sleep 60
                       done
 
-                      # Construct the new URLs
                       CODER_CLOUDFRONT_URL="https://$CLOUDFRONT_DOMAIN"
                       CODER_CLOUDFRONT_WILDCARD="*.$CLOUDFRONT_DOMAIN"
 
@@ -881,7 +1075,6 @@ Resources:
                         sleep 3
                       done
 
-                      # Health Check Step 2: Check Coder Pod Status
                       echo "=== Health Check: Verifying Coder Pod Status ==="
                       kubectl get pods -n coder -o wide
                       POD_STATUS=$(kubectl get pods -n coder -o jsonpath='{.items[0].status.phase}')
@@ -893,18 +1086,16 @@ Resources:
                         kubectl describe pod -n coder $(kubectl get pods -n coder -o jsonpath='{.items[0].metadata.name}')
                       fi
 
-                      # Health Check Step 3: Test Direct NLB Access
                       echo "=== Health Check: Testing Direct NLB Connectivity ==="
-                      ALB_HEALTH_CHECK=$(curl -s -o /dev/null -w "%{http_code}" -m 10 http://$CODER_LB_HOSTNAME/api/v2/buildinfo)
-                      echo "NLB Health Check Response: $ALB_HEALTH_CHECK"
+                      NLB_HEALTH_CHECK=$(curl -s -o /dev/null -w "%{http_code}" -m 10 http://$CODER_LB_HOSTNAME/api/v2/buildinfo)
+                      echo "NLB Health Check Response: $NLB_HEALTH_CHECK"
                       
-                      if [ "$ALB_HEALTH_CHECK" != "200" ]; then
-                        echo "WARNING: NLB health check failed with status $ALB_HEALTH_CHECK"
+                      if [ "$NLB_HEALTH_CHECK" != "200" ]; then
+                        echo "WARNING: NLB health check failed with status $NLB_HEALTH_CHECK"
                       else
                         echo "SUCCESS: NLB is responding correctly"
                       fi
 
-                      # Health Check Step 4: Test CloudFront Access
                       echo "=== Health Check: Testing CloudFront Connectivity ==="
                       CF_HEALTH_CHECK=$(curl -s -o /dev/null -w "%{http_code}" -m 10 $CODER_CLOUDFRONT_URL/api/v2/buildinfo)
                       echo "CloudFront Health Check Response: $CF_HEALTH_CHECK"
@@ -920,13 +1111,10 @@ Resources:
                       fi
 
                       echo "Deploying Coder GitOps Template Repository: $CoderGitOpsTemplateRepoURL"
-                      git clone $CoderGitOpsTemplateRepoURL
-                      CODER_GITOPS_DIR=$(basename "$CoderGitOpsTemplateRepoURL" .git)
                       CODER_AGENT_URL="$CODER_CLOUDFRONT_URL"; export CODER_AGENT_URL
                       cd $CODER_GITOPS_DIR/templates 
 
                       if [ "$RetryFlag" != "True" ]; then
-                        #Perform initial Coder Login and create initial admin user
                         echo "Creating initial Coder Administrator User"
                         LOGIN_SUCCESS=false
                         for attempt in {1..10}; do
@@ -935,8 +1123,7 @@ Resources:
                             --first-user-email $CoderAdminEmail \
                             --first-user-username $CoderAdminUser \
                             --first-user-password "$CoderAdminPassword" \
-                            --first-user-full-name "$CoderAdminName" \
-                            --first-user-trial=$CoderPremiumTrial; then
+                            --first-user-full-name "$CoderAdminName"; then
                             LOGIN_SUCCESS=true
                             echo "Coder login successful"
                             break
@@ -945,17 +1132,185 @@ Resources:
                           sleep $((attempt * 15))
                         done
 
-                        # Create a session token for template deployment
                         CODER_SESSION_TOKEN=$(coder tokens create --lifetime 120)
                         echo "Session token created successfully"
 
-                        # Store token in Secrets Manager
                         aws secretsmanager put-secret-value \
                           --secret-id "$CoderSessionTokenSecretArn" \
                           --secret-string "$CODER_SESSION_TOKEN"
                         echo "Session token stored in Secrets Manager" 
+
+                        if [ -n "$CoderLicenseKey" ]; then
+                          coder licenses add -l "$CoderLicenseKey"
+                        fi
+
+                        echo "=== Configuring Coder AI Providers ==="
+                        CODER_URL="${CODER_CLOUDFRONT_URL}"
+                        BEDROCK_REGION="us-east-1"  # Anthropic inference profiles available in us-east-1
+                        BEDROCK_ENDPOINT="https://bedrock-runtime.${BEDROCK_REGION}.amazonaws.com"
+                        BEDROCK_MANTLE_ENDPOINT="https://bedrock-mantle.${BEDROCK_REGION}.api.aws/v1"
+                        BEDROCK_USER="coder-bedrock-api-key-user-${STACK_NAME}"
+
+                        EXISTING_SECRET=$(aws secretsmanager get-secret-value \
+                          --secret-id "${BEDROCK_MANTLE_SECRET_ARN}" \
+                          --region "${AWSRegion}" \
+                          --query SecretString --output text 2>/dev/null || echo "")
+
+                        if [ -z "${EXISTING_SECRET}" ] || [ "${EXISTING_SECRET}" = "PENDING_CODEBUILD_POPULATION" ]; then
+                          echo "Creating Bedrock service-specific credential for ${BEDROCK_USER}..."
+                          for CRED_ID in $(aws iam list-service-specific-credentials \
+                            --user-name "${BEDROCK_USER}" \
+                            --service-name bedrock.amazonaws.com \
+                            --query 'ServiceSpecificCredentials[*].ServiceSpecificCredentialId' \
+                            --output text 2>/dev/null); do
+                            aws iam delete-service-specific-credential \
+                              --user-name "${BEDROCK_USER}" \
+                              --service-specific-credential-id "${CRED_ID}" 2>/dev/null || true
+                          done
+
+                          CRED_JSON=$(aws iam create-service-specific-credential \
+                            --user-name "${BEDROCK_USER}" \
+                            --service-name bedrock.amazonaws.com \
+                            --credential-age-days 30)
+                          BEDROCK_MANTLE_KEY=$(echo "${CRED_JSON}" | python3 -c \
+                            "import json,sys; print(json.load(sys.stdin)['ServiceSpecificCredential']['ServiceCredentialSecret'])")
+                          aws secretsmanager put-secret-value \
+                            --secret-id "${BEDROCK_MANTLE_SECRET_ARN}" \
+                            --secret-string "${BEDROCK_MANTLE_KEY}" \
+                            --region "${AWSRegion}"
+                          echo "ServiceCredentialSecret stored in Secrets Manager."
+                        else
+                          echo "Bedrock Mantle secret already populated; reusing."
+                          BEDROCK_MANTLE_KEY="${EXISTING_SECRET}"
+                        fi
+
+                        echo "Configuring AWS Bedrock (native) provider..."
+                        curl -sf -X POST \
+                          -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
+                          -H "Content-Type: application/json" \
+                          "${CODER_URL}/api/v2/ai/providers" \
+                          -d "{\"type\":\"bedrock\",\"name\":\"bedrock\",\"display_name\":\"AWS Bedrock\",\"enabled\":true,\"base_url\":\"${BEDROCK_ENDPOINT}\",\"settings\":{\"_type\":\"bedrock\",\"_version\":1,\"model\":\"global.anthropic.claude-opus-4-6-v1\",\"region\":\"${BEDROCK_REGION}\",\"small_fast_model\":\"global.anthropic.claude-haiku-4-5-20251001-v1:0\"}}" \
+                          || curl -sf -X PATCH \
+                          -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
+                          -H "Content-Type: application/json" \
+                          "${CODER_URL}/api/v2/ai/providers/bedrock" \
+                          -d "{\"display_name\":\"AWS Bedrock\",\"enabled\":true,\"base_url\":\"${BEDROCK_ENDPOINT}\",\"settings\":{\"_type\":\"bedrock\",\"_version\":1,\"model\":\"global.anthropic.claude-opus-4-6-v1\",\"region\":\"${BEDROCK_REGION}\",\"small_fast_model\":\"global.anthropic.claude-haiku-4-5-20251001-v1:0\"}}"
+                        echo "Bedrock (native) provider configured."
+
+                        echo "Configuring OpenAI-compat Bedrock Mantle provider..."
+                        curl -sf -X POST \
+                          -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
+                          -H "Content-Type: application/json" \
+                          "${CODER_URL}/api/v2/ai/providers" \
+                          -d "{\"type\":\"openai\",\"name\":\"openai-compat\",\"display_name\":\"OpenAI via AWS Bedrock\",\"enabled\":true,\"base_url\":\"${BEDROCK_MANTLE_ENDPOINT}\",\"api_keys\":[\"${BEDROCK_MANTLE_KEY}\"]}" \
+                          || curl -sf -X PATCH \
+                          -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
+                          -H "Content-Type: application/json" \
+                          "${CODER_URL}/api/v2/ai/providers/openai-compat" \
+                          -d "{\"display_name\":\"OpenAI via AWS Bedrock\",\"enabled\":true,\"base_url\":\"${BEDROCK_MANTLE_ENDPOINT}\",\"api_keys\":[\"${BEDROCK_MANTLE_KEY}\"]}"
+                        echo "OpenAI-compat Bedrock Mantle provider configured."
+
+                        echo "Configuring Chat Model Configs..."
+
+                        BEDROCK_PROVIDER_ID=$(curl -sf \
+                          -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
+                          "${CODER_URL}/api/v2/ai/providers/bedrock" \
+                          | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+                        echo "Bedrock provider ID: ${BEDROCK_PROVIDER_ID}"
+
+                        OPENAI_PROVIDER_ID=$(curl -sf \
+                          -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
+                          "${CODER_URL}/api/v2/ai/providers/openai-compat" \
+                          | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+                        echo "OpenAI-compat provider ID: ${OPENAI_PROVIDER_ID}"
+
+
+                        echo "Adding model: Claude Opus 4.6 (Bedrock)..."
+                        curl -sf -X POST \
+                          -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
+                          -H "Content-Type: application/json" \
+                          "${CODER_URL}/api/experimental/chats/model-configs" \
+                          -d "{
+                            \"ai_provider_id\": \"${BEDROCK_PROVIDER_ID}\",
+                            \"model\": \"global.anthropic.claude-opus-4-6-v1\",
+                            \"display_name\": \"Claude Opus 4.6\",
+                            \"enabled\": true,
+                            \"is_default\": true,
+                            \"context_limit\": 1000000,
+                            \"model_config\": {
+                              \"max_output_tokens\": 128000,
+                              \"provider_options\": {
+                                \"anthropic\": {
+                                  \"send_reasoning\": true,
+                                  \"effort\": \"high\"
+                                }
+                              }
+                            }
+                          }" || echo "  (may already exist)"
+
+                        echo "Adding model: Claude Haiku 4.5 (Bedrock)..."
+                        curl -sf -X POST \
+                          -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
+                          -H "Content-Type: application/json" \
+                          "${CODER_URL}/api/experimental/chats/model-configs" \
+                          -d "{
+                            \"ai_provider_id\": \"${BEDROCK_PROVIDER_ID}\",
+                            \"model\": \"global.anthropic.claude-haiku-4-5-20251001-v1:0\",
+                            \"display_name\": \"Claude Haiku 4.5\",
+                            \"enabled\": true,
+                            \"is_default\": false,
+                            \"context_limit\": 200000,
+                            \"model_config\": {
+                              \"max_output_tokens\": 64000,
+                              \"provider_options\": {
+                                \"anthropic\": {
+                                  \"send_reasoning\": true,
+                                  \"thinking\": {
+                                    \"budget_tokens\": 8192
+                                  }
+                                }
+                              }
+                            }
+                          }" || echo "  (may already exist)"
+
+
+                        echo "Adding model: OpenAI gpt-oss-120b (OpenAI-compat)..."
+                        curl -sf -X POST \
+                          -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
+                          -H "Content-Type: application/json" \
+                          "${CODER_URL}/api/experimental/chats/model-configs" \
+                          -d "{
+                            \"ai_provider_id\": \"${OPENAI_PROVIDER_ID}\",
+                            \"model\": \"openai.gpt-oss-120b\",
+                            \"display_name\": \"OpenAI gpt-oss-120b\",
+                            \"enabled\": true,
+                            \"is_default\": false,
+                            \"context_limit\": 128000,
+                            \"model_config\": {
+                              \"max_output_tokens\": 8192
+                            }
+                          }" || echo "  (may already exist)"
+
+                        echo "Adding model: Devstral 2 (OpenAI-compat)..."
+                        curl -sf -X POST \
+                          -H "Coder-Session-Token: ${CODER_SESSION_TOKEN}" \
+                          -H "Content-Type: application/json" \
+                          "${CODER_URL}/api/experimental/chats/model-configs" \
+                          -d "{
+                            \"ai_provider_id\": \"${OPENAI_PROVIDER_ID}\",
+                            \"model\": \"mistral.devstral-2-123b\",
+                            \"display_name\": \"Devstral 2 123B\",
+                            \"enabled\": true,
+                            \"is_default\": false,
+                            \"context_limit\": 128000,
+                            \"model_config\": {
+                              \"max_output_tokens\": 8192
+                            }
+                          }" || echo "  (may already exist)"
+
+                        echo "Chat Model Configs configured successfully."
+                        echo "=== AI Provider Configuration Complete ==="
                       else
-                        # Create a session token for template deployment
                         CODER_SESSION_TOKEN=$(aws secretsmanager get-secret-value --secret-id partner-coder-session-token --query SecretString --output text)
                         echo "Session token received successfully"
                         
@@ -968,13 +1323,10 @@ Resources:
                       fi
 
                       echo "Deploying GitOps templates via Terraform: $CODER_AGENT_URL"
-                      # Ensure AWS credentials are available to Terraform
-                      # CodeBuild provides credentials via AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
                       if [ -n "$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" ]; then
                         export AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
                       fi
 
-                      # Also export standard credential variables if they exist
                       if [ -n "$AWS_ACCESS_KEY_ID" ]; then
                         export AWS_ACCESS_KEY_ID
                         export AWS_SECRET_ACCESS_KEY
@@ -984,18 +1336,22 @@ Resources:
                       export AWS_DEFAULT_REGION="$AWSRegion"
                       export AWS_REGION="$AWSRegion"
 
-                      # Verify credentials work
                       echo "Testing AWS credentials..."
                       aws sts get-caller-identity
 
                       terraform init
 
-                      # Additional wait for Coder API to be fully responsive
                       sleep 120
 
                       ./templates_gitops.sh $CODER_SESSION_TOKEN
                     fi
                     
+                    # Use CLOUDFRONT_DOMAIN env var directly 
+                    SSM_CODER_URL="https://${CLOUDFRONT_DOMAIN}"
+                    echo "Setting SSM parameters..."
+                    echo "SSM_CODER_URL: ${SSM_CODER_URL}"
+                    aws configure set cli_follow_urlparam false
+                    aws ssm put-parameter --name "coder-cloudfront-url" --value "${SSM_CODER_URL}" --type "String" --overwrite
                     aws ssm put-parameter --name "/eks/${EKSClusterName}/cluster-name" --value "${EKSClusterName}" --type "String" --overwrite
                     aws ssm put-parameter --name "/eks/${EKSClusterName}/region" --value "${AWSRegion}" --type "String" --overwrite
                   fi
@@ -1162,8 +1518,8 @@ Outputs:
     Value: !Ref CoderAdminEmail
 
   CoderAdminPassword:
-    Description: Coder Admin Password
-    Value: !Ref CoderAdminPassword
+    Description: Coder Admin Password - retrieve from Secrets Manager using the ARN below
+    Value: !Sub 'Stored in Secrets Manager: ${CoderAdminPasswordSecret}'
 
   CoderAdminPasswordSecretArn:
     Description: ARN of the Coder Admin Password Secret
@@ -1180,3 +1536,39 @@ Outputs:
   CloudFormationStack:
     Description: Stack name for reference in scripts
     Value: !Ref AWS::StackName
+
+  FargateSubnet1Id:
+    Description: Fargate Subnet 1 ID
+    Value: !Ref FargateSubnet1
+
+  FargateSubnet2Id:
+    Description: Fargate Subnet 2 ID
+    Value: !Ref FargateSubnet2
+
+  FargatePodExecutionRoleArn:
+    Description: Fargate Pod Execution Role ARN
+    Value: !GetAtt FargatePodExecutionRole.Arn
+
+  EfsFileSystemId:
+    Description: EFS File System ID for workspace persistent storage
+    Value: !Ref EfsFileSystem
+
+  ClaudeCodeImageUri:
+    Description: ECR URI for Claude Code workspace image
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EKSClusterName}/coder-workspace-claude-code:latest'
+
+  KiroCliImageUri:
+    Description: ECR URI for Kiro CLI workspace image
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EKSClusterName}/coder-workspace-kiro-cli:latest'
+
+  ChallengeImageUri:
+    Description: ECR URI for Challenge workspace image
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EKSClusterName}/coder-workspace-challenge:latest'
+
+  BedrockMantleApiKeySecretArn:
+    Description: ARN of the Bedrock Mantle API key secret (ServiceCredentialSecret)
+    Value: !Ref BedrockMantleApiKeySecret
+
+  BedrockApiKeyUserName:
+    Description: IAM user that owns the Bedrock service-specific credential
+    Value: !Ref BedrockApiKeyUser

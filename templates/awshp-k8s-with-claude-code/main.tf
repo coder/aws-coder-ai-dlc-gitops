@@ -12,74 +12,108 @@ terraform {
             source = "hashicorp/random"
             version = "3.7.2"
         }
+        aws = {
+            source = "hashicorp/aws"
+            version = ">= 5.0"
+        }
     }
 }
 
 variable "namespace" {
   type        = string
   description = "The Kubernetes namespace to create workspaces in (must exist prior to creating workspaces)."
-  default     = "coder"
+  default     = "coder-ws"
+}
+
+variable "workspace_image" {
+  type        = string
+  description = "Container image for workspace pods"
+  default     = "codercom/enterprise-base:ubuntu"
+}
+
+variable "efs_file_system_id" {
+  type        = string
+  description = "EFS file system ID for persistent workspace storage"
+  default     = ""
 }
 
 variable "anthropic_model" {
   type        = string
   description = "The AWS Inference profile ID of the base Anthropic model to use with Claude Code"
-  default     = "global.anthropic.claude-opus-4-5-20251101-v1:0"
+  default     = "global.anthropic.claude-opus-4-6-v1"
 }
 
-data "coder_task" "me" {}
+variable "mcp_api_key_fiddler" {
+  type        = string
+  description = "Fiddler AI API key (Bearer) for the Fiddler GenAI MCP server."
+  sensitive   = true
+  default     = ""
+}
+
+variable "fiddler_url" {
+  type        = string
+  description = "Fiddler instance base URL for the Fiddler GenAI MCP server (optional)."
+  default     = "https://app.fiddler.ai"
+}
+
+variable "mcp_api_key_langsmith" {
+  type        = string
+  description = "LangSmith API key (sent as X-Api-Key) for the LangSmith remote MCP server."
+  sensitive   = true
+  default     = ""
+}
+
+variable "mcp_api_key_llamacloud" {
+  type        = string
+  description = "LlamaCloud API key for the LlamaCloud MCP server."
+  sensitive   = true
+  default     = ""
+}
+
+variable "llamacloud_project_name" {
+  type        = string
+  description = "Optional LlamaCloud project name for the LlamaCloud MCP server."
+  default     = ""
+}
+
+variable "llamacloud_index" {
+  type        = string
+  description = "Optional LlamaCloud index ('name:description') exposed as a tool by the LlamaCloud MCP server."
+  default     = ""
+}
 
 locals {
   home_dir = "/home/coder"
   bin_path = "/home/coder/.local/bin:/home/coder/bin:/home/coder/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   cost     = 2
-  port     = 3000
-  domain   = element(split("/", data.coder_workspace.me.access_url), -1)
-  
-  task_prompt = join(" ", [
-    "First, post a 'task started' update to Coder.",
-    "Then, review all of your memory.",
-    "Finally, ${data.coder_task.me.prompt}.",
-  ])
-  
-  system_prompt = <<-EOT
-    Hey! First, report an initial task to Coder to show you have started! The user has provided you with a prompt of something to create. Create it the best you can, and keep it as succinct as possible.
-    
-    If you're being tasked to create a web application, then:
-    - ALWAYS start the server using `python3` or `node` on localhost:${local.port}.
-    - BEFORE starting the server, ALWAYS attempt to kill ANY process using port ${local.port}, and then run the dev server on port ${local.port}.
-    - ALWAYS build the project using dev servers (and ALWAYS VIA desktop-commander)
-    - When finished, you should use Playwright to review the HTML to ensure it is working as expected.
 
-    ALWAYS run long-running commands (e.g. `pnpm dev` or `npm run dev`) using desktop-commander so it runs it in the background and users can prompt you.  Other short-lived commands (build, test, cd, write, read, view, etc) can run normally.
-
-    NEVER run the dev server without desktop-commander.
-
-    For previewing, always use the dev server for fast feedback loops (never do a full Next.js build, for exmaple). A simple HTML/static is preferred for web applications, but pick the best AND lightest framework for the job.
-    
-    The dev server will ALWAYS be on localhost:${local.port} and NEVER start on another port. If the dev server crashes for some reason, kill port ${local.port} (or the desktop-commander session) and restart the dev server.
-
-    After large changes, use Playwright to ensure your changes work (preview localhost:${local.port}). Take a screenshot, look at the screenshot. Also look at the HTML output from Playwright. If there are errors or something looks "off," fix it.
-    
-    Aim to autonomously investigate and solve issues the user gives you and test your work, whenever possible.
-    
-    Avoid shortcuts like mocking tests. When you get stuck, you can ask the user but opt for autonomy.
-    
-    In your task reports to Coder:
-    - Be specific about what you're doing
-    - Clearly indicate what information you need from the user when in "failure" state
-    - Keep it under 160 characters
-    - Make it actionable
-
-    If you're being tasked to create a Coder template, then,
-    - You must ALWAYS ask the user for permission to push it. 
-    - You are NOT allowed to push templates OR create workspaces from them without the users explicit approval.
-
-    If you're being tasked to create additional Coder tasks or workspaces, ALWAYS use `coder task create` instead of `coder create`.
-    - Example: coder task create --template "awshp-k8s-with-claude-code" "<your prompt here>"
-
-    When reporting URLs to Coder, report to "https://preview--dev--${data.coder_workspace.me.name}--${data.coder_workspace_owner.me.name}.${local.domain}/" that proxies port ${local.port}
-  EOT
+  # MCP servers added to Claude Code at user scope: Fiddler GenAI (observability)
+  # + LangSmith (LangChain) as remote HTTP, LlamaCloud (LlamaIndex) over stdio via
+  # uvx. Security partners (HiddenLayer, Protopia) have no MCP server; their SDKs
+  # are pre-baked in the image instead.
+  mcp_servers = merge(
+    {
+      "fiddler-genai" = {
+        type    = "http"
+        url     = "${var.fiddler_url}/v1/mcp/genai/"
+        headers = { Authorization = "Bearer ${var.mcp_api_key_fiddler}" }
+      }
+      "langsmith" = {
+        type    = "http"
+        url     = "https://api.smith.langchain.com/mcp"
+        headers = { "X-Api-Key" = var.mcp_api_key_langsmith }
+      }
+      "llamacloud" = {
+        command = "/usr/local/bin/uvx"
+        args = concat(
+          ["llamacloud-mcp@latest", "--api-key", var.mcp_api_key_llamacloud],
+          var.llamacloud_project_name != "" ? ["--project-name", var.llamacloud_project_name] : [],
+          var.llamacloud_index != "" ? ["--index", var.llamacloud_index] : [],
+        )
+      }
+    }
+  )
+  mcp_json = jsonencode({ mcpServers = local.mcp_servers })
 }
 
 # Minimum vCPUs needed 
@@ -114,21 +148,6 @@ data "coder_parameter" "memory" {
   order     = 2
 }
 
-data "coder_parameter" "disk_size" {
-  name        = "PVC storage size"
-  type        = "number"
-  description = "Number of GB of storage for '${local.home_dir}'! This will persist after the workspace's K8s Pod is shutdown or deleted."
-  icon        = "https://www.pngall.com/wp-content/uploads/5/Database-Storage-PNG-Clipart.png"
-  validation {
-    min       = 10
-    max       = 50
-    monotonic = "increasing"
-  }
-  form_type = "slider"
-  mutable   = true
-  default   = 30
-  order     = 3
-}
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
@@ -148,12 +167,38 @@ resource "coder_env" "path" {
 resource "coder_agent" "dev" {
     arch = "amd64"
     os = "linux"
-    dir = local.home_dir
+
     display_apps {
         vscode          = false
         vscode_insiders = false
         web_terminal    = true
         ssh_helper      = false
+    }
+
+    # Live workspace resource utilization shown in the Coder dashboard,
+    # using the agent's built-in `coder stat` command (pod/container-scoped).
+    metadata {
+        display_name = "CPU Usage"
+        key          = "0_cpu_usage"
+        script       = "coder stat cpu"
+        interval     = 10
+        timeout      = 1
+    }
+
+    metadata {
+        display_name = "RAM Usage"
+        key          = "1_ram_usage"
+        script       = "coder stat mem"
+        interval     = 10
+        timeout      = 1
+    }
+
+    metadata {
+        display_name = "Home Disk"
+        key          = "2_home_disk"
+        script       = "coder stat disk --path $HOME"
+        interval     = 60
+        timeout      = 1
     }
     startup_script = <<-EOT
     set -e
@@ -168,6 +213,56 @@ module "coder-login" {
     agent_id = coder_agent.dev.id
 }
 
+# Python 3.12 venv + Jupyter kernel for the workshop agent notebooks
+# (LangGraph/LangChain, LlamaIndex, Strands, Bedrock AgentCore). The workshop
+# images pre-bake this at /opt/venvs/agents with a system-wide "Python (Agents)"
+# kernel, so this script is a fast no-op there. On a non pre-baked base image it
+# falls back to provisioning into the EFS-persistent home (one-time).
+resource "coder_script" "agent_python_kernel" {
+    agent_id           = coder_agent.dev.id
+    display_name       = "Python/Jupyter agent kernel"
+    icon               = "/icon/python.svg"
+    run_on_start       = true
+    start_blocks_login = false
+    script             = <<-EOT
+    #!/bin/sh
+    set -eu
+
+    # Fast path: pre-baked in the workshop image (outside the EFS-mounted home).
+    if [ -x /opt/venvs/agents/bin/python ]; then
+      echo "Agent Python kernel pre-installed in image (/opt/venvs/agents)."
+      exit 0
+    fi
+
+    # Fallback for non pre-baked base images: provision into the persistent home.
+    VENV="$HOME/.venvs/agents"
+    SENTINEL="$VENV/.provisioned"
+    if [ -f "$SENTINEL" ]; then
+      echo "Agent Python kernel already provisioned at $VENV"
+      exit 0
+    fi
+    command -v uv >/dev/null 2>&1 || { echo "uv unavailable; skipping kernel setup."; exit 0; }
+
+    export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
+    export UV_LINK_MODE=copy
+    mkdir -p "$HOME/.venvs"
+    uv venv --python 3.12 --seed "$VENV"
+    uv pip install --python "$VENV/bin/python" \
+      ipykernel \
+      "boto3>=1.39.0" "botocore>=1.39.0" "pydantic>=2.0.0" \
+      bedrock-agentcore bedrock-agentcore-starter-toolkit \
+      langchain langchain-core langchain-aws langchain-anthropic langchain-community langgraph \
+      "llama-index>=0.12.0" llama-index-core llama-index-llms-bedrock \
+      llama-index-llms-bedrock-converse llama-index-embeddings-bedrock \
+      llama-index-readers-file llama-cloud \
+      strands-agents strands-agents-tools
+    "$VENV/bin/python" -m ipykernel install --user \
+      --name agents --display-name "Python (Agents)"
+    touch "$SENTINEL"
+    echo "Provisioned Jupyter kernel 'Python (Agents)' -> $VENV"
+    EOT
+}
+
 module "code-server" {
     source   = "registry.coder.com/coder/code-server/coder"
     version  = "1.3.1"
@@ -175,6 +270,7 @@ module "code-server" {
     folder         = local.home_dir
     subdomain = false
     order = 0
+    extensions = ["ms-toolsai.jupyter"]
 }
 
 module "kiro" {
@@ -182,6 +278,55 @@ module "kiro" {
     version  = "1.1.0"
     agent_id = coder_agent.dev.id
     order = 1
+}
+
+# Auto-install the Jupyter extension for the Kiro IDE.
+# Kiro connects as a desktop client and downloads its remote server on first
+# connect, so we install into the (EFS-persistent) Kiro server extensions dir:
+# immediately if the server is already present, otherwise via a one-time
+# background poller. Dependencies resolve automatically from Open VSX.
+resource "coder_script" "kiro_jupyter_extension" {
+    agent_id           = coder_agent.dev.id
+    display_name       = "Kiro: install Jupyter extension"
+    icon               = "/icon/kiro.svg"
+    run_on_start       = true
+    start_blocks_login = false
+    script             = <<-EOT
+    #!/bin/sh
+    set -eu
+    EXT_ID="ms-toolsai.jupyter"
+    KIRO_BIN="$HOME/.kiro-server/bin"
+    SENTINEL="$HOME/.kiro-server/.jupyter-ext-installed"
+
+    if [ -f "$SENTINEL" ]; then
+      echo "Kiro: $EXT_ID already provisioned."
+      exit 0
+    fi
+
+    install_ext() {
+      SRV=$(find "$KIRO_BIN" -maxdepth 3 -type f -name kiro-server 2>/dev/null | head -1)
+      [ -n "$SRV" ] || return 1
+      "$SRV" --install-extension "$EXT_ID" && touch "$SENTINEL"
+    }
+
+    if install_ext; then
+      echo "Kiro: installed $EXT_ID."
+    else
+      # Server not downloaded yet (first connect pending) - poll in background.
+      (
+        i=0
+        while [ "$i" -lt 120 ]; do
+          sleep 30
+          if install_ext; then
+            echo "Kiro: installed $EXT_ID after connect."
+            break
+          fi
+          i=$((i + 1))
+        done
+      ) >/tmp/kiro-jupyter-install.log 2>&1 &
+      echo "Kiro: will install $EXT_ID on first connect (background)."
+    fi
+    EOT
 }
 
 module "claude-code" {
@@ -192,104 +337,28 @@ module "claude-code" {
     agent_id            = coder_agent.dev.id
     workdir             = local.home_dir
     subdomain           = false
-    ai_prompt           = local.task_prompt
-    system_prompt       = local.system_prompt
     report_tasks        = true
     dangerously_skip_permissions = true
-  # permission_mode     = "bypassPermissions"
+    mcp                 = local.mcp_json
         
     pre_install_script = <<-EOF
-    set -e    
-    
-    sudo apt update
-    sudo apt install -y curl unzip gnupg dirmngr jq
-    
-    # Move cross module/workspace requirements into single place to avoid race conditions
-    
+    set -e
+
     # Create persistent bin directory
     mkdir -p $HOME/bin
     mkdir -p $HOME/.local/bin
-    
+
     # Update PATH for current session
-    export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
-
-    # install Node.js and npm (required for CDK)
-    if ! command -v node &> /dev/null; then
-      echo "Installing Node.js..."
-      # Add NodeSource repository for the latest LTS version
-      curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-      sudo apt-get install nodejs -y
-      
-      # Verify installation
-      node -v
-      npm -v
-      
-      echo "Node.js installation completed"
-    else
-      echo "Node.js is already installed"
-      node -v
-    fi
-
-    # install AWS CLI to persistent location
-    if ! command -v aws &> /dev/null; then
-      echo "Installing AWS CLI..."
-      cd $HOME
-      curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-      unzip -q awscliv2.zip
-      
-      # Install to home directory instead of system-wide
-      ./aws/install --install-dir $HOME/.local/aws-cli --bin-dir $HOME/.local/bin
-      
-      # Verify installation
-      aws --version
-      
-      # Cleanup
-      rm -rf aws awscliv2.zip
-      
-      echo "AWS CLI installation completed"
-    else
-      echo "AWS CLI is already installed"
-      aws --version
-    fi
-
-    # install AWS CDK to persistent location
-    if ! command -v cdk &> /dev/null; then
-      echo "Installing AWS CDK..."
-      
-      # Configure npm to use home directory for global packages
-      mkdir -p $HOME/.npm-global
-      npm config set prefix "$HOME/.npm-global"
-      
-      # Install AWS CDK to home directory
-      npm install -g aws-cdk
-      
-      # Create symlink in bin directory
-      ln -sf $HOME/.npm-global/bin/cdk $HOME/.local/bin/cdk
-      
-      # Verify CDK installation
-      cdk --version
-      
-      echo "AWS CDK installation completed"
-    else
-      echo "AWS CDK is already installed"
-      cdk --version
-    fi
+    export PATH="$HOME/.local/bin:$HOME/bin:$HOME/.npm-global/bin:$PATH"
 
     #Symlink Coder Agent
-    ln -sf /tmp/coder.*/coder "$CODER_SCRIPT_BIN_DIR/coder" 
+    ln -sf /tmp/coder.*/coder "$CODER_SCRIPT_BIN_DIR/coder"
 
     EOF
 
     post_install_script = <<-EOF
 
-# Install uv (Python package manager) which includes uvx         
-if [ ! -f "$HOME/.local/bin/uv" ]; then                          
-  UV_UNMANAGED_INSTALL="$HOME/.local/bin" curl -LsSf https://astral.sh/uv/install.sh | sh                             
-fi   
-
 # Bypass the dangerously-skip-permissions TOS prompt
-# Required due to Claude Code bug: the --dangerously-skip-permissions flag alone
-# does not suppress the interactive dialog; settings.json must also be set.
 mkdir -p "$HOME/.claude"
 if [ -f "$HOME/.claude/settings.json" ]; then
   tmp=$(mktemp) && jq '. + {"skipDangerousModePermissionPrompt": true}' "$HOME/.claude/settings.json" > "$tmp" && mv "$tmp" "$HOME/.claude/settings.json" || true
@@ -302,53 +371,64 @@ EOF
     order               = 999
 }
 
-resource "coder_ai_task" "claude-code" {
-    count  = data.coder_workspace.me.start_count
-    app_id = module.claude-code[0].task_app_id
+
+resource "aws_efs_access_point" "home" {
+  file_system_id = var.efs_file_system_id
+
+  posix_user {
+    uid = 1000
+    gid = 1000
+  }
+
+  root_directory {
+    path = "/workspaces/${data.coder_workspace.me.id}"
+    creation_info {
+      owner_uid   = 1000
+      owner_gid   = 1000
+      permissions = "0755"
+    }
+  }
+
+  tags = {
+    Name = "coder-${data.coder_workspace.me.name}-home"
+    "com.coder.workspace.id" = data.coder_workspace.me.id
+  }
 }
 
-resource "coder_app" "preview" {
-    agent_id     = coder_agent.dev.id
-    slug         = "preview"
-    display_name = "Preview your app"
-    icon         = "${data.coder_workspace.me.access_url}/emojis/1f50e.png"
-    url          = "http://localhost:${local.port}"
-    share        = "authenticated"
-    subdomain    = false
-    open_in      = "tab"
-    order = 3
-    healthcheck {
-        url       = "http://localhost:${local.port}/"
-        interval  = 5
-        threshold = 15
+resource "kubernetes_persistent_volume" "home" {
+  metadata {
+    name = "coder-${data.coder_workspace.me.id}-home"
+  }
+  spec {
+    capacity = {
+      storage = "50Gi"
     }
+    access_modes                     = ["ReadWriteMany"]
+    persistent_volume_reclaim_policy = "Retain"
+    storage_class_name               = "efs-static"
+    volume_mode                      = "Filesystem"
+    persistent_volume_source {
+      csi {
+        driver        = "efs.csi.aws.com"
+        volume_handle = "${var.efs_file_system_id}::${aws_efs_access_point.home.id}"
+      }
+    }
+  }
 }
 
 resource "kubernetes_persistent_volume_claim" "home" {
   metadata {
     name      = "coder-${data.coder_workspace.me.id}-home"
     namespace = var.namespace
-    labels = {
-      "app.kubernetes.io/name"     = "coder-pvc"
-      "app.kubernetes.io/instance" = "coder-pvc-${data.coder_workspace.me.id}"
-      "app.kubernetes.io/part-of"  = "coder"
-      //Coder-specific labels.
-      "com.coder.resource"       = "true"
-      "com.coder.workspace.id"   = data.coder_workspace.me.id
-      "com.coder.workspace.name" = data.coder_workspace.me.name
-      "com.coder.user.id"        = data.coder_workspace_owner.me.id
-      "com.coder.user.username"  = data.coder_workspace_owner.me.name
-    }
-    annotations = {
-      "com.coder.user.email" = data.coder_workspace_owner.me.email
-    }
   }
-  wait_until_bound = false
+  wait_until_bound = true
   spec {
-    access_modes = ["ReadWriteOnce"]
+    access_modes       = ["ReadWriteMany"]
+    storage_class_name = "efs-static"
+    volume_name        = kubernetes_persistent_volume.home.metadata.0.name
     resources {
       requests = {
-        storage = "${data.coder_parameter.disk_size.value}Gi"
+        storage = "50Gi"
       }
     }
   }
@@ -356,9 +436,6 @@ resource "kubernetes_persistent_volume_claim" "home" {
 
 resource "kubernetes_deployment" "dev" {
   count = data.coder_workspace.me.start_count
-  depends_on = [
-    kubernetes_persistent_volume_claim.home
-  ]
   wait_for_rollout = false
   metadata {
     name      = "coder-${data.coder_workspace.me.id}"
@@ -414,14 +491,15 @@ resource "kubernetes_deployment" "dev" {
           run_as_user = 1000
           fs_group    = 1000
         }
-        service_account_name = "coder"
+        service_account_name = "coder-ws"
         container {
           name              = "dev"
-          image             = "codercom/enterprise-base:ubuntu"
+          image             = var.workspace_image
           image_pull_policy = "Always"
           command           = ["sh", "-c", coder_agent.dev.init_script]
           security_context {
-            run_as_user = "1000"
+            run_as_user                = "1000"
+            allow_privilege_escalation = false
           }
           env {
             name  = "CODER_AGENT_TOKEN"
@@ -429,8 +507,8 @@ resource "kubernetes_deployment" "dev" {
           }
           resources {
             requests = {
-              "cpu"    = "250m"
-              "memory" = "512Mi"
+              "cpu"    = "${data.coder_parameter.cpu.value}"
+              "memory" = "${data.coder_parameter.memory.value}Gi"
             }
             limits = {
               "cpu"    = "${data.coder_parameter.cpu.value}"
@@ -452,25 +530,6 @@ resource "kubernetes_deployment" "dev" {
           }
         }
 
-        affinity {
-          // This affinity attempts to spread out all workspace pods evenly across
-          // nodes.
-          pod_anti_affinity {
-            preferred_during_scheduling_ignored_during_execution {
-              weight = 1
-              pod_affinity_term {
-                topology_key = "kubernetes.io/hostname"
-                label_selector {
-                  match_expressions {
-                    key      = "app.kubernetes.io/name"
-                    operator = "In"
-                    values   = ["coder-workspace"]
-                  }
-                }
-              }
-            }
-          }
-        }
       }
     }
   }

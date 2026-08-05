@@ -10,7 +10,7 @@ Parameters:
   GitRepoURL:
     Description: Git repository URL containing the Dockerfiles
     Type: String
-    Default: "https://github.com/greg-the-coder/aws-coder-ai-dlc-gitops.git"
+    Default: "https://github.com/coder/aws-coder-ai-dlc-gitops.git"
 
   GitBranch:
     Description: Git branch to build from
